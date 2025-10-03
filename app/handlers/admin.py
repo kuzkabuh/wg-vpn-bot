@@ -65,10 +65,6 @@ async def admin_menu(c: CallbackQuery):
     if not _is_admin(getattr(c.from_user, "id", None)):
         await c.message.answer("Доступ запрещён.")
         return
-    try:
-        await c.answer()
-    except Exception:
-        pass
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Общая статистика", callback_data="admin:stats")
     kb.button(text="🧩 Конфигурации", callback_data="admin:cfgs")
@@ -84,11 +80,6 @@ async def admin_stats(c: CallbackQuery):
         await c.message.answer("Доступ запрещён.")
         return
     try:
-        await c.answer()
-    except Exception:
-        pass
-
-    try:
         totals = await wgd.totals()
     except WGDError as e:
         await c.message.answer(f"Ошибка получения статистики: {e}")
@@ -98,15 +89,11 @@ async def admin_stats(c: CallbackQuery):
         "📊 <b>Общая статистика</b>\n"
         f"Конфигураций: <b>{totals['configs']}</b>\n"
         f"Пиров всего: <b>{totals['peers']}</b>\n"
-        f"Онлайн: <b>{totals['active_peers']}</b> • "
-        f"Оффлайн: <b>{totals['peers'] - totals['active_peers']}</b>\n"
+        f"Онлайн: <b>{totals['active_peers']}</b> • Оффлайн: <b>{totals['peers'] - totals['active_peers']}</b>\n"
         f"Трафик RX: <b>{_fmt_bytes(totals['rx'])}</b>\n"
         f"Трафик TX: <b>{_fmt_bytes(totals['tx'])}</b>"
     )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="◀️ Меню", callback_data="admin:menu")
-    kb.adjust(1)
-    await c.message.answer(text, reply_markup=kb.as_markup())
+    await c.message.answer(text)
 
 
 # ─── config list ──────────────────────────────────────────────────────────────
@@ -116,10 +103,6 @@ async def admin_cfgs(c: CallbackQuery):
     if not _is_admin(getattr(c.from_user, "id", None)):
         await c.message.answer("Доступ запрещён.")
         return
-    try:
-        await c.answer()
-    except Exception:
-        pass
 
     try:
         snap = await wgd.snapshot()
@@ -131,7 +114,6 @@ async def admin_cfgs(c: CallbackQuery):
         await c.message.answer("Конфигурации не найдены.")
         return
 
-    # Сводка в виде компактной таблицы с кнопками «Открыть»
     header = "CFG           Пиров   Актив   RX        TX"
     sep    = "------------  ------  ------  --------  --------"
     rows = []
@@ -145,7 +127,6 @@ async def admin_cfgs(c: CallbackQuery):
             f"{cfg_name:<12}  {len(peers):>6}  {active:>6}  {(_fmt_bytes(rx)):>8}  {(_fmt_bytes(tx)):>8}"
         )
         kb.button(text=f"Открыть {cfg_name}", callback_data=f"admin:cfg:{cfg_name}:0")
-    kb.button(text="◀️ Меню", callback_data="admin:menu")
     kb.adjust(1)
 
     text = "🧩 <b>Конфигурации</b>\n<code>\n" + header + "\n" + sep + "\n" + "\n".join(rows) + "\n</code>"
@@ -155,7 +136,6 @@ async def admin_cfgs(c: CallbackQuery):
 # ─── peers in config (with pagination) ────────────────────────────────────────
 
 def _parse_cfg_req(data: str) -> Tuple[str, int]:
-    # data like "admin:cfg:<name>:<offset>"
     payload = data.split("admin:cfg:", 1)[-1]
     if ":" in payload:
         name, off = payload.rsplit(":", 1)
@@ -170,10 +150,6 @@ async def admin_cfg_details(c: CallbackQuery):
     if not _is_admin(getattr(c.from_user, "id", None)):
         await c.message.answer("Доступ запрещён.")
         return
-    try:
-        await c.answer()
-    except Exception:
-        pass
 
     cfg_name, offset = _parse_cfg_req(c.data)
 
@@ -194,7 +170,6 @@ async def admin_cfg_details(c: CallbackQuery):
         await c.message.answer(f"В конфигурации <code>{cfg_name}</code> пиры отсутствуют.")
         return
 
-    # Пагинация по 30 строк
     page_size = 30
     start = min(offset, max(0, total - 1))
     start = (start // page_size) * page_size
@@ -206,11 +181,9 @@ async def admin_cfg_details(c: CallbackQuery):
     sep     = "------  ----------------------------  --------  --------  ----"
     rows = []
 
-    # Активные сверху внутри страницы: сортируем по активности и объёму трафика
-    part_sorted = sorted(part, key=lambda p: (not p["active"], -(p["rx"] + p["tx"])))
-    for p in part_sorted:
+    for p in part:
         status = _status_dot(p["active"])
-        name = (p["name"] or "")[:28]
+        name = p["name"][:28]
         rx = _fmt_bytes(p["rx"])
         tx = _fmt_bytes(p["tx"])
         hs = _fmt_dt(p["last_handshake"])
@@ -218,7 +191,6 @@ async def admin_cfg_details(c: CallbackQuery):
 
     text = header + "\n<code>\n" + table_h + "\n" + sep + "\n" + "\n".join(rows) + "\n</code>"
 
-    # Кнопки навигации
     kb = InlineKeyboardBuilder()
     if start > 0:
         prev_off = max(0, start - page_size)
@@ -226,6 +198,5 @@ async def admin_cfg_details(c: CallbackQuery):
     if end < total:
         next_off = end
         kb.button(text="Вперёд ➡️", callback_data=f"admin:cfg:{cfg_name}:{next_off}")
-    kb.button(text="◀️ Меню", callback_data="admin:menu")
-    kb.adjust(2 if start > 0 and end < total else 1)
+    kb.adjust(2)
     await c.message.answer(text, reply_markup=kb.as_markup())
