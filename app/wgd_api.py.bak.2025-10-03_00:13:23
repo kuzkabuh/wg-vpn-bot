@@ -1,0 +1,64 @@
+import httpx
+from typing import Dict, Any, List, Optional, Tuple
+from .settings import SET
+
+# Карта эндпоинтов — при необходимости подгоню под вашу сборку
+EndpointMap = {
+    "peers_list": "/api/v4/peers",
+    "peer_create": "/api/v4/peers",
+    "peer_config": "/api/v4/peers/{peer_id}/config",
+    "peer_delete": "/api/v4/peers/{peer_id}",
+}
+
+def _auth_variants() -> List[Tuple[str, Dict[str, str]]]:
+    token = SET.wgd_api_token
+    variants = []
+    def add(kind, headers):
+        variants.append((kind, headers))
+    if SET.wgd_auth_scheme in ("auto", "bearer"):
+        add("bearer", {"Authorization": f"Bearer {token}"})
+    if SET.wgd_auth_scheme in ("auto", "x-api-key"):
+        add("x-api-key", {"X-API-Key": token})
+    if SET.wgd_auth_scheme in ("auto", "token"):
+        add("token", {"Authorization": f"Token {token}"})
+    return variants
+
+async def _request(method: str, path: str, json: Optional[Dict[str, Any]] = None) -> httpx.Response:
+    url = f"{SET.wgd_api_base.rstrip('/')}{path}"
+    timeout = httpx.Timeout(15.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        last = None
+        for kind, headers in _auth_variants():
+            try:
+                resp = await cli.request(method, url, headers=headers, json=json)
+                # Если 401 — пробуем следующую схему
+                if resp.status_code == 401:
+                    last = resp
+                    continue
+                return resp
+            except Exception as e:
+                last = e
+        # если все варианты не подошли — кидаем последнюю ошибку/ответ
+        if isinstance(last, httpx.Response):
+            return last
+        raise RuntimeError(f"WGD request failed: {last}")
+
+async def list_peers() -> List[Dict[str, Any]]:
+    r = await _request("GET", EndpointMap["peers_list"])
+    r.raise_for_status()
+    return r.json()
+
+async def create_peer(name: str, interface: str) -> Dict[str, Any]:
+    payload = {"name": name, "interface": interface}
+    r = await _request("POST", EndpointMap["peer_create"], json=payload)
+    r.raise_for_status()
+    return r.json()
+
+async def get_peer_config(peer_id: str) -> str:
+    r = await _request("GET", EndpointMap["peer_config"].format(peer_id=peer_id))
+    r.raise_for_status()
+    return r.text
+
+async def delete_peer(peer_id: str) -> None:
+    r = await _request("DELETE", EndpointMap["peer_delete"].format(peer_id=peer_id))
+    r.raise_for_status()

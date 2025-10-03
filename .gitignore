@@ -1,0 +1,30 @@
+# venv / caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# data/runtime
+/data/
+data/
+*.db
+*.sqlite*
+*.log
+logs/
+*.png
+*.conf
+
+# dist
+dist/
+build/

@@ -1,0 +1,18 @@
+[Unit]
+Description=WG VPN Telegram Bot (aiogram + FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wg-vpn-bot
+Environment="PYTHONPATH=/opt/wg-vpn-bot"
+EnvironmentFile=/opt/wg-vpn-bot/.env
+ExecStart=/opt/wg-vpn-bot/.venv/bin/uvicorn app.webhook:app --host 127.0.0.1 --port 8081 --loop uvloop --http httptools --proxy-headers --forwarded-allow-ips="*"
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
