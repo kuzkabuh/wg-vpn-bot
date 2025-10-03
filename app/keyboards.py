@@ -1,20 +1,65 @@
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton as K
+# app/keyboards.py
+from __future__ import annotations
 
-def kb_register() -> InlineKeyboardMarkup:
+from typing import Iterable, List, Sequence, Tuple
+
+from aiogram.types import InlineKeyboardButton as K
+from aiogram.types import InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+# ───────────────────────── low-level helpers ─────────────────────────
+
+def _kb_from_rows(rows: Sequence[Sequence[Tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """
+    Построить InlineKeyboardMarkup из списка строк,
+    где каждая строка — последовательность пар (текст, callback_data).
+    """
     b = InlineKeyboardBuilder()
-    b.button(text="Регистрация", callback_data="reg:start")
+    for row in rows:
+        b.row(*(K(text=text, callback_data=data) for text, data in row))
     return b.as_markup()
 
+
+# ───────────────────────── public factories ─────────────────────────
+
+def kb_register() -> InlineKeyboardMarkup:
+    """Кнопка регистрации для пользователей со статусом pending."""
+    return _kb_from_rows([[("Регистрация", "reg:start")]])
+
+
 def kb_user_main(is_admin: bool = False) -> InlineKeyboardMarkup:
-    kb = [
-        [K(text="📊 Статистика", callback_data="user:stats")],
-        [K(text="🔌 Мои подключения", callback_data="user:peers")],
-        [K(text="➕ Новое подключение", callback_data="user:newpeer")],
-        [K(text="🗑 Удалить последнее", callback_data="user:delpeer")],
+    """
+    Главное меню пользователя. Для админа добавляем блок административных кнопок.
+    """
+    rows: List[List[Tuple[str, str]]] = [
+        [("📊 Статистика", "user:stats")],
+        [("🔌 Мои подключения", "user:peers")],
+        [("➕ Новое подключение", "user:newpeer")],
+        [("🗑 Удалить последнее", "user:delpeer")],
     ]
+
     if is_admin:
-        kb.append([K(text="🛠 Админ: статистика", callback_data="admin:stats")])
-        kb.append([K(text="📋 Конфигурации", callback_data="admin:cfgs")])
-        kb.append([K(text="👥 Все пиры", callback_data="admin:peers")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+        rows += [
+            [("📈 Общая статистика", "admin:stats")],
+            [("🧩 Конфигурации", "admin:cfgs")],
+            [("👥 Все пиры", "admin:peers")],
+        ]
+
+    return _kb_from_rows(rows)
+
+
+def kb_admin_main() -> InlineKeyboardMarkup:
+    """Главное меню админа (если хочется вызывать напрямую)."""
+    rows = [
+        [("📈 Общая статистика", "admin:stats")],
+        [("🧩 Конфигурации", "admin:cfgs")],
+        [("👥 Все пиры", "admin:peers")],
+        [("⬅️ Меню", "up:main")],
+    ]
+    return _kb_from_rows(rows)
+
+
+def kb_back_to_menu(label: str = "⬅️ Меню") -> InlineKeyboardMarkup:
+    """Одна кнопка «Назад в меню» (callback up:main). Удобно переиспользовать в карточках."""
+    return _kb_from_rows([[(label, "up:main")]])
