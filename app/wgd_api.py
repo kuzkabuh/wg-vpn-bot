@@ -1,8 +1,11 @@
+# app/wgd_api.py
 from __future__ import annotations
 
+import base64
 import ipaddress
 import os
-import base64
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -210,6 +213,14 @@ class WGDAPI:
             peers = cfg.get("peers")
         return peers if isinstance(peers, list) else []
 
+    def _cfg_address(self, cfg: Dict[str, Any]) -> Optional[str]:
+        # пытаемся достать серверный адрес/префикс конфигурации
+        for k in ("Address", "address", "AddressIPv4", "AddressIpv4"):
+            v = cfg.get(k)
+            if isinstance(v, str) and "/" in v:
+                return v
+        return None
+
     def _peer_id(self, peer: Dict[str, Any]) -> Optional[str]:
         # разные реализации: id / peer_id / Id
         for key in ("id", "peer_id", "Id"):
@@ -225,6 +236,34 @@ class WGDAPI:
 
     def _peer_allowed_ip(self, peer: Dict[str, Any]) -> Optional[str]:
         return peer.get("allowed_ip") or peer.get("AllowedIP") or peer.get("AllowedIp")
+
+    def _peer_handshake_ts(self, peer: Dict[str, Any]) -> Optional[int]:
+        # разные варианты ключей в форках:
+        for k in ("LatestHandshake", "latestHandshake", "latest_handshake",
+                  "LastHandshake", "lastHandshake", "Handshake", "handshake"):
+            v = peer.get(k)
+            ts = self._to_unix(v)
+            if ts is not None:
+                return ts
+        return None
+
+    def _peer_transfer_pair(self, peer: Dict[str, Any]) -> Tuple[int, int]:
+        # ищем rx/tx в разных стилях
+        candidates = [
+            ("rx", "tx"),
+            ("Rx", "Tx"),
+            ("receive", "sent"),
+            ("download", "upload"),
+            ("transferRx", "transferTx"),
+            ("TransferRx", "TransferTx"),
+            ("ReceiveBytes", "TransmitBytes"),
+        ]
+        for rxk, txk in candidates:
+            rx = peer.get(rxk)
+            tx = peer.get(txk)
+            if rx is not None or tx is not None:
+                return self._num(rx), self._num(tx)
+        return 0, 0
 
     async def _find_peer_info(self, peer_id_or_key: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
@@ -248,13 +287,21 @@ class WGDAPI:
         Выбирает следующий свободный /32 адрес в подсети конфигурации.
         Если не удаётся — падает назад на 10.66.66.2/32.
         """
-        used: set[int] = set()
-        target = None
-        for cfg in await self.get_configs():
-            if self._cfg_name(cfg) == config:
-                target = cfg
-                break
+        # попытаемся понять подсеть из самого конфига
+        cfgs = await self.get_configs()
+        target = next((c for c in cfgs if self._cfg_name(c) == config), None)
 
+        network: Optional[ipaddress.IPv4Network] = None
+        if target:
+            addr_str = self._cfg_address(target)  # например "10.0.20.1/24"
+            if addr_str:
+                try:
+                    iface = ipaddress.ip_interface(addr_str)
+                    network = iface.network
+                except Exception:
+                    network = None
+
+        used: set[int] = set()
         if target:
             for p in self._cfg_peers(target):
                 ip_cidr = self._peer_allowed_ip(p)
@@ -267,11 +314,18 @@ class WGDAPI:
                     continue
                 used.add(int(ip))
 
+        # если знаем подсеть — пробуем пройтись по host'ам
+        if network:
+            # считаем, что .1 занят сервером, начнем с .2
+            for ip in network.hosts():
+                if int(ip) not in used and ip.packed[-1] not in (0, 1):
+                    return f"{ip}/32"
+
+        # Fallback — старое поведение
         if not used:
             return "10.66.66.2/32"
 
         current = max(used) + 1
-        # избегаем .0 и .1 в хостовой части
         if ipaddress.IPv4Address(current).packed[-1] in (0, 1):
             current += 1
         return f"{ipaddress.IPv4Address(current)}/32"
@@ -386,7 +440,7 @@ class WGDAPI:
         if arg2 is not None:
             cfg_name = arg1
             public_key = arg2
-            filename, content = await self.download_peer_conf(cfg_name, public_key)
+            _, content = await self.download_peer_conf(cfg_name, public_key)
             try:
                 return content.decode("utf-8")
             except UnicodeDecodeError:
@@ -396,9 +450,9 @@ class WGDAPI:
         needle = str(arg1)
         found = await self._find_peer_info(needle)
         if not found:
-            # если не нашли по id — попробуем считать, что нам передали уже publicKey
+            # если не нашли по id — попробуем считать, что нам передали уже publicKey и использовать дефолтный интерфейс
             cfg_name = SET.wgd_interface
-            filename, content = await self.download_peer_conf(cfg_name, needle)
+            _, content = await self.download_peer_conf(cfg_name, needle)
             try:
                 return content.decode("utf-8")
             except UnicodeDecodeError:
@@ -412,13 +466,13 @@ class WGDAPI:
             last = []
             for k, v in attempts:
                 try:
-                    filename, content = await self.download_peer_conf(cfg_name, v)  # вдруг сервер примет это как id
+                    _, content = await self.download_peer_conf(cfg_name, v)  # вдруг сервер примет это как id
                     return content.decode("utf-8")
                 except Exception as e:
                     last.append(f"{k}: {type(e).__name__}")
             raise WGDError("Peer found, but publicKey missing. Tried legacy params: " + ", ".join(last))
 
-        filename, content = await self.download_peer_conf(cfg_name, public_key)
+        _, content = await self.download_peer_conf(cfg_name, public_key)
         try:
             return content.decode("utf-8")
         except UnicodeDecodeError:
@@ -443,8 +497,95 @@ class WGDAPI:
         cfg = found[0] if found else SET.wgd_interface
         await self.delete_peers(cfg, [pid])
         return True
-    
-    # ==== В КОНЕЦ КЛАССА WGDAPI ДОБАВЬ ЭТО ====
+
+    # ---------- Admin helpers (для обзора всех конфигов/пиров) ----------
+
+    async def list_config_names(self) -> List[str]:
+        return [self._cfg_name(c) for c in await self.get_configs() if self._cfg_name(c)]
+
+    async def get_config_with_peers(self, name: str) -> Dict[str, Any]:
+        """
+        Возвращает объект конфига с полем Peers/peers.
+        Если в общей выдаче Peers пустые — пробуем детальные эндпоинты.
+        """
+        name = str(name)
+        configs = await self.get_configs()
+        for cfg in configs:
+            if self._cfg_name(cfg) == name and self._cfg_peers(cfg):
+                return cfg
+
+        # пробуем детальные пути (в разных форках по-разному называются)
+        attempts = [
+            f"/api/getWireguardConfiguration/{quote(name)}",
+            f"/api/getWireguardConfig/{quote(name)}",
+            f"/api/getWGConfiguration/{quote(name)}",
+        ]
+        last_err = None
+        for path in attempts:
+            try:
+                data = await self._arequest("GET", path)
+                obj = data.get("data") if isinstance(data, dict) else None
+                if isinstance(obj, dict) and self._cfg_peers(obj) is not None:
+                    return obj
+            except Exception as e:
+                last_err = e
+        # вернем хотя бы оболочку
+        for cfg in configs:
+            if self._cfg_name(cfg) == name:
+                return cfg
+        raise WGDError(f"Config '{name}' not found: {last_err or 'no data'}")
+
+    async def peers_of(self, name: str) -> List[Dict[str, Any]]:
+        cfg = await self.get_config_with_peers(name)
+        return self._cfg_peers(cfg)
+
+    async def all_configs_with_counts(self) -> List[Dict[str, Any]]:
+        out = []
+        for cfg in await self.get_configs():
+            nm = self._cfg_name(cfg)
+            if not nm:
+                continue
+            peers = self._cfg_peers(cfg)
+            out.append({"name": nm, "peers_count": len(peers or [])})
+        return out
+
+    async def aggregate_stats(self) -> Dict[str, Any]:
+        """
+        Суммарная статистика по всем конфигам: количество конфигов/пиров, онлайн/оффлайн, трафик.
+        Онлайн считаем по рукопожатию < 180 секунд.
+        """
+        now = int(time.time())
+        online_window = 180
+
+        total_cfg = 0
+        total_peers = 0
+        online = 0
+        offline = 0
+        sum_rx = 0
+        sum_tx = 0
+
+        for cfg in await self.get_configs():
+            total_cfg += 1
+            for p in self._cfg_peers(cfg):
+                total_peers += 1
+                hs = self._peer_handshake_ts(p) or 0
+                if now - hs <= online_window:
+                    online += 1
+                else:
+                    offline += 1
+                rx, tx = self._peer_transfer_pair(p)
+                sum_rx += rx
+                sum_tx += tx
+
+        return {
+            "configs": total_cfg,
+            "peers": total_peers,
+            "online": online,
+            "offline": offline,
+            "rx": sum_rx,
+            "tx": sum_tx,
+        }
+
     # ---------- Normalization & snapshots ----------
 
     def _num(self, v) -> int:
@@ -461,15 +602,15 @@ class WGDAPI:
             return 0
 
     def _to_unix(self, v) -> Optional[int]:
-        # Приходит как seconds / ms / string / None
+        # Вход может быть в секундах/мс/строке/ISO/None
         try:
             if v is None:
                 return None
             if isinstance(v, (int, float)):
                 x = float(v)
-                if x > 1e12:  # ns
+                if x > 1e12:       # наносекунды
                     x = x / 1e9
-                elif x > 1e10:  # ms
+                elif x > 1e10:     # миллисекунды
                     x = x / 1e3
                 return int(x)
             s = str(v).strip()
@@ -477,13 +618,23 @@ class WGDAPI:
                 return None
             # просто число в строке?
             try:
-                return int(float(s))
+                x = float(s)
+                if x > 1e12:
+                    x = x / 1e9
+                elif x > 1e10:
+                    x = x / 1e3
+                return int(x)
             except Exception:
                 pass
-            # ISO/RFC?
-            from datetime import datetime
-            from dateutil import parser as dtparser  # если нет dateutil — убери этот блок
-            return int(dtparser.parse(s).timestamp())
+            # ISO-строка
+            s2 = s.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(s2)
+            except Exception:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
         except Exception:
             return None
 
@@ -503,22 +654,26 @@ class WGDAPI:
         for k in ("LatestHandshake", "latestHandshake", "latest_handshake", "LastHandshake"):
             if k in p and p[k] is not None:
                 return self._to_unix(p[k])
-        return None
+        # запасной путь
+        return self._peer_handshake_ts(p)
+
+    def _peer_name(self, p: Dict[str, Any]) -> str:
+        pk = self._peer_public_key(p) or ""
+        return p.get("name") or p.get("Name") or (pk[-8:] if pk else "(no-name)")
 
     def _norm_peer(self, cfg_name: str, p: Dict[str, Any]) -> Dict[str, Any]:
         pid = self._peer_id(p) or self._peer_public_key(p) or ""
-        pk  = self._peer_public_key(p) or ""
-        name = p.get("name") or p.get("Name") or (pk[-8:] if pk else str(pid))
+        pk = self._peer_public_key(p) or ""
+        name = self._peer_name(p)
         allowed_ip = self._peer_allowed_ip(p) or ""
         rx = self._peer_rx(p)
         tx = self._peer_tx(p)
         hs = self._peer_last_hs(p)
         active = False
         try:
-            import time
             active = (hs is not None) and (time.time() - hs <= 130)
         except Exception:
-            pass
+            active = False
         return {
             "config": cfg_name,
             "id": str(pid),
@@ -541,7 +696,6 @@ class WGDAPI:
         for cfg in await self.get_configs():
             name = self._cfg_name(cfg)
             if not name:
-                # пропустим сломанные
                 continue
             peers = [self._norm_peer(name, p) for p in self._cfg_peers(cfg)]
             snap[name] = {"raw": cfg, "peers": peers}
@@ -556,7 +710,12 @@ class WGDAPI:
         tx = sum(p["tx"] for v in snap.values() for p in v["peers"])
         return {"configs": cfgs, "peers": peers, "active_peers": active, "rx": rx, "tx": tx}
 
-    def find_peer_in_snapshot(self, snap: Dict[str, Dict[str, Any]], cfg_name: str, peer_id: str) -> Optional[Dict[str, Any]]:
+    def find_peer_in_snapshot(
+        self,
+        snap: Dict[str, Dict[str, Any]],
+        cfg_name: str,
+        peer_id: str
+    ) -> Optional[Dict[str, Any]]:
         """
         Быстрый поиск нормализованного пира в уже полученном снапшоте.
         Сравниваем и по id, и по public_key.
@@ -566,7 +725,6 @@ class WGDAPI:
             if p["id"] == str(peer_id) or (p["public_key"] and p["public_key"] == str(peer_id)):
                 return p
         return None
-# ==== КОНЕЦ ДОБАВКИ ====
 
 
 # Экземпляр по умолчанию

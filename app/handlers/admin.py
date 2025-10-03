@@ -1,139 +1,231 @@
-# app/handlers/admin.py
-from datetime import datetime, timezone
+from __future__ import annotations
+
+import time
+from typing import Optional, Tuple
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ..settings import SET
-from ..db import list_pending, get_user_by_tgid, update_user
-from ..utils import plan_apply, human_dt
-
-__all__ = ["router"]
+from ..wgd_api import wgd, WGDError
 
 router = Router()
 
 
-def _is_admin(user_id: int) -> bool:
-    return user_id in SET.admin_ids
+# ─── helpers ──────────────────────────────────────────────────────────────────
 
+def _is_admin(tg_id: Optional[int]) -> bool:
+    return bool(tg_id) and tg_id in SET.admin_ids
+
+def _fmt_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    x = float(n or 0)
+    i = 0
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024.0
+        i += 1
+    return f"{x:.1f} {units[i]}"
+
+def _fmt_dt(ts: Optional[int]) -> str:
+    if not ts:
+        return "—"
+    try:
+        delta = int(time.time()) - int(ts)
+        if delta < 0:
+            delta = 0
+        if delta < 60:
+            return f"{delta}s"
+        if delta < 3600:
+            return f"{delta // 60}m"
+        if delta < 86400:
+            return f"{delta // 3600}h"
+        return f"{delta // 86400}d"
+    except Exception:
+        return "—"
+
+def _status_dot(active: bool) -> str:
+    return "🟢" if active else "⚪️"
+
+
+# ─── menu ─────────────────────────────────────────────────────────────────────
+
+@router.message(F.text.startswith("/admin"))
+async def cmd_admin(m: Message):
+    if not _is_admin(getattr(m.from_user, "id", None)):
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Общая статистика", callback_data="admin:stats")
+    kb.button(text="🧩 Конфигурации", callback_data="admin:cfgs")
+    kb.adjust(1, 1)
+    await m.answer("Админ-панель:", reply_markup=kb.as_markup())
 
 @router.callback_query(F.data == "admin:menu")
-async def admin_menu(c: CallbackQuery) -> None:
-    # быстрый ACK, чтобы не висел "часик"
+async def admin_menu(c: CallbackQuery):
+    if not _is_admin(getattr(c.from_user, "id", None)):
+        await c.message.answer("Доступ запрещён.")
+        return
+    try:
+        await c.answer()
+    except Exception:
+        pass
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Общая статистика", callback_data="admin:stats")
+    kb.button(text="🧩 Конфигурации", callback_data="admin:cfgs")
+    kb.adjust(1, 1)
+    await c.message.answer("Админ-панель:", reply_markup=kb.as_markup())
+
+
+# ─── stats ────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(c: CallbackQuery):
+    if not _is_admin(getattr(c.from_user, "id", None)):
+        await c.message.answer("Доступ запрещён.")
+        return
     try:
         await c.answer()
     except Exception:
         pass
 
-    if not c.from_user or not _is_admin(c.from_user.id):
+    try:
+        totals = await wgd.totals()
+    except WGDError as e:
+        await c.message.answer(f"Ошибка получения статистики: {e}")
+        return
+
+    text = (
+        "📊 <b>Общая статистика</b>\n"
+        f"Конфигураций: <b>{totals['configs']}</b>\n"
+        f"Пиров всего: <b>{totals['peers']}</b>\n"
+        f"Онлайн: <b>{totals['active_peers']}</b> • "
+        f"Оффлайн: <b>{totals['peers'] - totals['active_peers']}</b>\n"
+        f"Трафик RX: <b>{_fmt_bytes(totals['rx'])}</b>\n"
+        f"Трафик TX: <b>{_fmt_bytes(totals['tx'])}</b>"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Меню", callback_data="admin:menu")
+    kb.adjust(1)
+    await c.message.answer(text, reply_markup=kb.as_markup())
+
+
+# ─── config list ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:cfgs")
+async def admin_cfgs(c: CallbackQuery):
+    if not _is_admin(getattr(c.from_user, "id", None)):
         await c.message.answer("Доступ запрещён.")
         return
-
-    await c.message.answer(
-        "Админ-панель:\n"
-        "• /pending — заявки\n"
-        "• /grant_trial &lt;tg_id&gt;\n"
-        "• /grant_paid &lt;tg_id&gt;\n"
-        "• /grant_unlim &lt;tg_id&gt;"
-    )
-
-
-@router.message(F.text.startswith("/pending"))
-async def admin_pending(m: Message) -> None:
-    if not m.from_user or not _is_admin(m.from_user.id):
-        return
-
-    pend = list_pending()
-    if not pend:
-        await m.answer("Нет заявок.")
-        return
-
-    lines = ["Заявки:"]
-    for u in pend:
-        uname = f"@{u.username}" if getattr(u, "username", None) else "(нет username)"
-        lines.append(f"• tg_id={getattr(u, 'tg_id', '?')} {uname}")
-    await m.answer("\n".join(lines))
-
-
-def _parse_tg_id(arg: str | None) -> int | None:
-    if not arg:
-        return None
     try:
-        return int(arg.strip())
+        await c.answer()
     except Exception:
-        return None
-
-
-async def _apply_and_notify(m: Message, tg_id: int, plan: str, ok_text: str) -> None:
-    u = get_user_by_tgid(tg_id)
-    if not u:
-        await m.answer("Пользователь не найден")
-        return
-
-    # используем UTC-наивную совместимость через aware-дату
-    now = datetime.now(timezone.utc)
-    expires_at, limit = plan_apply(plan, now)
-
-    # Обновляем юзера
-    update_user(u, status="approved", plan=plan, devices_limit=limit, expires_at=expires_at)
-
-    # Ответ админу
-    exp_human = human_dt(expires_at) if expires_at else "∞"
-    await m.answer(f"{ok_text} До: {exp_human} (unix={expires_at or '∞'}).")
-
-    # Пытаемся оповестить пользователя в ЛС
-    try:
-        await m.bot.send_message(
-            tg_id,
-            (
-                "✅ Доступ активирован.\n"
-                f"Тариф: {plan}\n"
-                f"Лимит устройств: {'безлимит' if (limit is not None and limit < 0) else limit}\n"
-                f"Действует до: {exp_human}"
-            ),
-        )
-    except Exception:
-        # молча игнорируем, если нельзя написать
         pass
 
-
-@router.message(F.text.startswith("/grant_trial"))
-async def grant_trial(m: Message) -> None:
-    if not m.from_user or not _is_admin(m.from_user.id):
+    try:
+        snap = await wgd.snapshot()
+    except WGDError as e:
+        await c.message.answer(f"Ошибка: {e}")
         return
 
-    parts = (m.text or "").split(maxsplit=1)
-    tg_id = _parse_tg_id(parts[1] if len(parts) > 1 else None)
-    if tg_id is None:
-        await m.answer("Формат: /grant_trial &lt;tg_id&gt;")
+    if not snap:
+        await c.message.answer("Конфигурации не найдены.")
         return
 
-    await _apply_and_notify(m, tg_id, plan="trial", ok_text="OK. Выдан trial.")
+    # Сводка в виде компактной таблицы с кнопками «Открыть»
+    header = "CFG           Пиров   Актив   RX        TX"
+    sep    = "------------  ------  ------  --------  --------"
+    rows = []
+    kb = InlineKeyboardBuilder()
+    for cfg_name, bucket in sorted(snap.items()):
+        peers = bucket["peers"]
+        active = sum(1 for p in peers if p["active"])
+        rx = sum(p["rx"] for p in peers)
+        tx = sum(p["tx"] for p in peers)
+        rows.append(
+            f"{cfg_name:<12}  {len(peers):>6}  {active:>6}  {(_fmt_bytes(rx)):>8}  {(_fmt_bytes(tx)):>8}"
+        )
+        kb.button(text=f"Открыть {cfg_name}", callback_data=f"admin:cfg:{cfg_name}:0")
+    kb.button(text="◀️ Меню", callback_data="admin:menu")
+    kb.adjust(1)
+
+    text = "🧩 <b>Конфигурации</b>\n<code>\n" + header + "\n" + sep + "\n" + "\n".join(rows) + "\n</code>"
+    await c.message.answer(text, reply_markup=kb.as_markup())
 
 
-@router.message(F.text.startswith("/grant_paid"))
-async def grant_paid(m: Message) -> None:
-    if not m.from_user or not _is_admin(m.from_user.id):
+# ─── peers in config (with pagination) ────────────────────────────────────────
+
+def _parse_cfg_req(data: str) -> Tuple[str, int]:
+    # data like "admin:cfg:<name>:<offset>"
+    payload = data.split("admin:cfg:", 1)[-1]
+    if ":" in payload:
+        name, off = payload.rsplit(":", 1)
+        try:
+            return name, max(0, int(off))
+        except Exception:
+            return payload, 0
+    return payload, 0
+
+@router.callback_query(F.data.startswith("admin:cfg:"))
+async def admin_cfg_details(c: CallbackQuery):
+    if not _is_admin(getattr(c.from_user, "id", None)):
+        await c.message.answer("Доступ запрещён.")
+        return
+    try:
+        await c.answer()
+    except Exception:
+        pass
+
+    cfg_name, offset = _parse_cfg_req(c.data)
+
+    try:
+        snap = await wgd.snapshot()
+    except WGDError as e:
+        await c.message.answer(f"Ошибка: {e}")
         return
 
-    parts = (m.text or "").split(maxsplit=1)
-    tg_id = _parse_tg_id(parts[1] if len(parts) > 1 else None)
-    if tg_id is None:
-        await m.answer("Формат: /grant_paid &lt;tg_id&gt;")
+    bucket = snap.get(cfg_name)
+    if not bucket:
+        await c.message.answer(f"Конфигурация <code>{cfg_name}</code> не найдена.")
         return
 
-    await _apply_and_notify(m, tg_id, plan="paid", ok_text="OK. Выдан paid.")
-
-
-@router.message(F.text.startswith("/grant_unlim"))
-async def grant_unlim(m: Message) -> None:
-    if not m.from_user or not _is_admin(m.from_user.id):
+    peers = bucket["peers"]
+    total = len(peers)
+    if total == 0:
+        await c.message.answer(f"В конфигурации <code>{cfg_name}</code> пиры отсутствуют.")
         return
 
-    parts = (m.text or "").split(maxsplit=1)
-    tg_id = _parse_tg_id(parts[1] if len(parts) > 1 else None)
-    if tg_id is None:
-        await m.answer("Формат: /grant_unlim &lt;tg_id&gt;")
-        return
+    # Пагинация по 30 строк
+    page_size = 30
+    start = min(offset, max(0, total - 1))
+    start = (start // page_size) * page_size
+    end = min(start + page_size, total)
+    part = peers[start:end]
 
-    await _apply_and_notify(m, tg_id, plan="unlimited", ok_text="OK. Выдан unlimited.")
+    header = f"🔹 <b>{cfg_name}</b>: {total} пиров (показано {start + 1}-{end})"
+    table_h = "Статус  Имя                            RX        TX        HS"
+    sep     = "------  ----------------------------  --------  --------  ----"
+    rows = []
+
+    # Активные сверху внутри страницы: сортируем по активности и объёму трафика
+    part_sorted = sorted(part, key=lambda p: (not p["active"], -(p["rx"] + p["tx"])))
+    for p in part_sorted:
+        status = _status_dot(p["active"])
+        name = (p["name"] or "")[:28]
+        rx = _fmt_bytes(p["rx"])
+        tx = _fmt_bytes(p["tx"])
+        hs = _fmt_dt(p["last_handshake"])
+        rows.append(f"{status:<6}  {name:<28}  {rx:>8}  {tx:>8}  {hs:>4}")
+
+    text = header + "\n<code>\n" + table_h + "\n" + sep + "\n" + "\n".join(rows) + "\n</code>"
+
+    # Кнопки навигации
+    kb = InlineKeyboardBuilder()
+    if start > 0:
+        prev_off = max(0, start - page_size)
+        kb.button(text="⬅️ Назад", callback_data=f"admin:cfg:{cfg_name}:{prev_off}")
+    if end < total:
+        next_off = end
+        kb.button(text="Вперёд ➡️", callback_data=f"admin:cfg:{cfg_name}:{next_off}")
+    kb.button(text="◀️ Меню", callback_data="admin:menu")
+    kb.adjust(2 if start > 0 and end < total else 1)
+    await c.message.answer(text, reply_markup=kb.as_markup())
